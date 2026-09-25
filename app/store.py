@@ -93,6 +93,49 @@ class JobStore:
             ).fetchone()
             return (self._row_to_job(row) if row else None), False
 
+    def try_accept_job(self, job: Job, max_queue_size: int) -> tuple[Job | None, str | None]:
+        """Atomically: dedup on idempotency key, enforce capacity, insert.
+
+        Returns (job, None) when accepted, (existing_job, 'duplicate') when the
+        key already exists, (None, 'queue_full') when over capacity — in which
+        case the row is immediately marked as a terminal rejection so it can
+        never be executed."""
+        now = time.time()
+        job.created_at = job.updated_at = now
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                """INSERT OR IGNORE INTO jobs
+                   (job_id, idempotency_key, job_type, payload, status, attempt,
+                    max_attempts, last_error, run_at, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (job.job_id, job.idempotency_key, job.job_type,
+                 json.dumps(job.payload), job.status.value, job.attempt,
+                 job.max_attempts, job.last_error, 0.0, now, now),
+            )
+            if cur.rowcount != 1:
+                row = self._conn.execute(
+                    "SELECT * FROM jobs WHERE idempotency_key = ?",
+                    (job.idempotency_key,),
+                ).fetchone()
+                return (self._row_to_job(row) if row else None), "duplicate"
+            pending = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM jobs WHERE status = 'pending'"
+            ).fetchone()["c"]
+            if pending > max_queue_size:
+                self._conn.execute(
+                    """UPDATE jobs SET status = 'failed', last_error = 'queue_full',
+                       updated_at = ? WHERE job_id = ? AND status = 'pending'""",
+                    (now, job.job_id),
+                )
+                self._conn.execute(
+                    """INSERT OR IGNORE INTO job_events
+                       (job_id, attempt, event, reason, created_at)
+                       VALUES (?,?,?,?,?)""",
+                    (job.job_id, 0, "rejected", "queue_full", now),
+                )
+                return None, "queue_full"
+            return job, None
+
     def get_job(self, job_id: str) -> Job | None:
         with self._lock:
             row = self._conn.execute(
