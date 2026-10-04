@@ -47,3 +47,7 @@ class QueueConfig:
     base_backoff_seconds: float = 0.05
     max_backoff_seconds: float = 1.0
     poll_interval_seconds: float = 0.02
+    # Queue overview: sliding window for "recent" rejection/failure signals,
+    # and how many events inside the window count as "sustained".
+    overview_window_seconds: float = 60.0
+    overview_sustained_threshold: int = 3
