@@ -17,6 +17,9 @@ class SubmitRequest(BaseModel):
     payload: dict = Field(default_factory=dict)
     idempotency_key: str
     max_attempts: int = 3
+    # Optional: wait up to this many seconds for queue capacity before
+    # rejecting with 429. Omitted / 0 keeps the old reject-immediately behavior.
+    wait_timeout_seconds: float | None = Field(default=None, ge=0)
 
 
 def _job_view(store: JobStore, job: Job) -> dict:
@@ -62,12 +65,14 @@ def create_app(queue: JobQueue | None = None, db_path: str = "jobs.db",
     @app.post("/jobs", status_code=202)
     async def submit_job(req: SubmitRequest):
         job, reason = await queue.submit(
-            req.job_type, req.payload, req.idempotency_key, req.max_attempts)
+            req.job_type, req.payload, req.idempotency_key, req.max_attempts,
+            wait_timeout_seconds=req.wait_timeout_seconds)
         if reason == RejectReason.QUEUE_FULL.value:
             return JSONResponse(
                 status_code=429,
                 content={"error": RejectReason.QUEUE_FULL.value,
-                         "detail": "queue capacity reached, retry later"},
+                         "detail": "queue capacity reached, retry later "
+                                   "with the same idempotency key"},
             )
         if reason == RejectReason.DUPLICATE.value:
             # Idempotent replay: return the existing job, do not re-execute.
@@ -75,6 +80,10 @@ def create_app(queue: JobQueue | None = None, db_path: str = "jobs.db",
                                 content={"duplicate": True,
                                          "job": _job_view(queue.store, job)})
         return {"duplicate": False, "job": _job_view(queue.store, job)}
+
+    @app.get("/queue/overview")
+    def queue_overview() -> dict:
+        return queue.overview()
 
     @app.get("/jobs/{job_id}")
     def get_job(job_id: str) -> dict:
