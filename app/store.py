@@ -37,6 +37,10 @@ CREATE TABLE IF NOT EXISTS job_events (
     created_at REAL NOT NULL,
     UNIQUE (job_id, attempt, event, reason)
 );
+CREATE TABLE IF NOT EXISTS counters (
+    name TEXT PRIMARY KEY,
+    value INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -98,13 +102,25 @@ class JobStore:
 
         Returns (job, None) when accepted, (existing_job, 'duplicate') when the
         key already exists, (None, 'queue_full') when over capacity — in which
-        case the row is immediately marked as a terminal rejection so it can
-        never be executed."""
+        case NO row is written, so the rejection leaves no placeholder record:
+        the same idempotency key can be resubmitted later and accepted once
+        capacity frees up, and the rejection never shows up as a job failure."""
         now = time.time()
         job.created_at = job.updated_at = now
         with self._lock, self._conn:
-            cur = self._conn.execute(
-                """INSERT OR IGNORE INTO jobs
+            row = self._conn.execute(
+                "SELECT * FROM jobs WHERE idempotency_key = ?",
+                (job.idempotency_key,),
+            ).fetchone()
+            if row is not None:
+                return self._row_to_job(row), "duplicate"
+            pending = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM jobs WHERE status = 'pending'"
+            ).fetchone()["c"]
+            if pending >= max_queue_size:
+                return None, "queue_full"
+            self._conn.execute(
+                """INSERT INTO jobs
                    (job_id, idempotency_key, job_type, payload, status, attempt,
                     max_attempts, last_error, run_at, created_at, updated_at)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
@@ -112,28 +128,6 @@ class JobStore:
                  json.dumps(job.payload), job.status.value, job.attempt,
                  job.max_attempts, job.last_error, 0.0, now, now),
             )
-            if cur.rowcount != 1:
-                row = self._conn.execute(
-                    "SELECT * FROM jobs WHERE idempotency_key = ?",
-                    (job.idempotency_key,),
-                ).fetchone()
-                return (self._row_to_job(row) if row else None), "duplicate"
-            pending = self._conn.execute(
-                "SELECT COUNT(*) AS c FROM jobs WHERE status = 'pending'"
-            ).fetchone()["c"]
-            if pending > max_queue_size:
-                self._conn.execute(
-                    """UPDATE jobs SET status = 'failed', last_error = 'queue_full',
-                       updated_at = ? WHERE job_id = ? AND status = 'pending'""",
-                    (now, job.job_id),
-                )
-                self._conn.execute(
-                    """INSERT OR IGNORE INTO job_events
-                       (job_id, attempt, event, reason, created_at)
-                       VALUES (?,?,?,?,?)""",
-                    (job.job_id, 0, "rejected", "queue_full", now),
-                )
-                return None, "queue_full"
             return job, None
 
     def get_job(self, job_id: str) -> Job | None:
@@ -250,3 +244,32 @@ class JobStore:
                 (job_id,),
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def count_by_status(self) -> dict[str, int]:
+        """Snapshot of live job counts per status (for the queue overview)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT status, COUNT(*) AS c FROM jobs GROUP BY status"
+            ).fetchall()
+            return {r["status"]: int(r["c"]) for r in rows}
+
+    def incr_counter(self, name: str, delta: int = 1) -> int:
+        """Atomically bump a persistent counter (survives restarts) and
+        return its new value."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO counters (name, value) VALUES (?, ?)
+                   ON CONFLICT(name) DO UPDATE SET value = value + ?""",
+                (name, delta, delta),
+            )
+            row = self._conn.execute(
+                "SELECT value FROM counters WHERE name = ?", (name,)
+            ).fetchone()
+            return int(row["value"])
+
+    def get_counter(self, name: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM counters WHERE name = ?", (name,)
+            ).fetchone()
+            return int(row["value"]) if row else 0
