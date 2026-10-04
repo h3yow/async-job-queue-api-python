@@ -10,6 +10,7 @@ import json
 import sqlite3
 import threading
 import time
+from collections import deque
 
 from app.models import Job, JobStatus
 
@@ -37,7 +38,15 @@ CREATE TABLE IF NOT EXISTS job_events (
     created_at REAL NOT NULL,
     UNIQUE (job_id, attempt, event, reason)
 );
+CREATE TABLE IF NOT EXISTS queue_meta (
+    key TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+);
 """
+
+#: job_events event names that represent real execution failures (as opposed
+#: to backpressure rejections, which never produce job_events at all).
+FAILURE_EVENTS = ("failed_retryable", "failed_non_retryable", "dead")
 
 
 class JobStore:
@@ -47,6 +56,10 @@ class JobStore:
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
+        # In-memory timestamps of recent backpressure rejections, used for the
+        # "recently rejecting" signal in the overview. Operational only; the
+        # cumulative total is persisted in queue_meta.
+        self._recent_rejections: deque[float] = deque()
 
     def init_schema(self) -> None:
         with self._lock, self._conn:
@@ -97,14 +110,33 @@ class JobStore:
         """Atomically: dedup on idempotency key, enforce capacity, insert.
 
         Returns (job, None) when accepted, (existing_job, 'duplicate') when the
-        key already exists, (None, 'queue_full') when over capacity — in which
-        case the row is immediately marked as a terminal rejection so it can
-        never be executed."""
+        key already exists, (None, 'queue_full') when over capacity.
+
+        A backpressure rejection leaves NO record behind: no job row and no
+        failure event, so the same idempotency key can be resubmitted later
+        and the rejection is never counted as a job failure. The rejection is
+        only reflected in the cumulative backpressure counter."""
         now = time.time()
         job.created_at = job.updated_at = now
         with self._lock, self._conn:
-            cur = self._conn.execute(
-                """INSERT OR IGNORE INTO jobs
+            row = self._conn.execute(
+                "SELECT * FROM jobs WHERE idempotency_key = ?",
+                (job.idempotency_key,),
+            ).fetchone()
+            if row is not None:
+                return self._row_to_job(row), "duplicate"
+            pending = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM jobs WHERE status = 'pending'"
+            ).fetchone()["c"]
+            if pending >= max_queue_size:
+                self._conn.execute(
+                    """INSERT INTO queue_meta (key, value) VALUES ('backpressure_rejected_total', 1)
+                       ON CONFLICT(key) DO UPDATE SET value = value + 1""",
+                )
+                self._recent_rejections.append(now)
+                return None, "queue_full"
+            self._conn.execute(
+                """INSERT INTO jobs
                    (job_id, idempotency_key, job_type, payload, status, attempt,
                     max_attempts, last_error, run_at, created_at, updated_at)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
@@ -112,28 +144,6 @@ class JobStore:
                  json.dumps(job.payload), job.status.value, job.attempt,
                  job.max_attempts, job.last_error, 0.0, now, now),
             )
-            if cur.rowcount != 1:
-                row = self._conn.execute(
-                    "SELECT * FROM jobs WHERE idempotency_key = ?",
-                    (job.idempotency_key,),
-                ).fetchone()
-                return (self._row_to_job(row) if row else None), "duplicate"
-            pending = self._conn.execute(
-                "SELECT COUNT(*) AS c FROM jobs WHERE status = 'pending'"
-            ).fetchone()["c"]
-            if pending > max_queue_size:
-                self._conn.execute(
-                    """UPDATE jobs SET status = 'failed', last_error = 'queue_full',
-                       updated_at = ? WHERE job_id = ? AND status = 'pending'""",
-                    (now, job.job_id),
-                )
-                self._conn.execute(
-                    """INSERT OR IGNORE INTO job_events
-                       (job_id, attempt, event, reason, created_at)
-                       VALUES (?,?,?,?,?)""",
-                    (job.job_id, 0, "rejected", "queue_full", now),
-                )
-                return None, "queue_full"
             return job, None
 
     def get_job(self, job_id: str) -> Job | None:
@@ -250,3 +260,49 @@ class JobStore:
                 (job_id,),
             ).fetchall()
             return [dict(r) for r in rows]
+
+    # ---- read-only overview statistics ------------------------------------
+
+    def status_counts(self) -> dict[str, int]:
+        """Current number of jobs per status, all statuses always present."""
+        counts = {s.value: 0 for s in JobStatus}
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT status, COUNT(*) AS c FROM jobs GROUP BY status"
+            ).fetchall()
+            for row in rows:
+                counts[row["status"]] = int(row["c"])
+        return counts
+
+    def backpressure_rejected_total(self) -> int:
+        """Cumulative number of capacity rejections (persistent)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM queue_meta WHERE key = 'backpressure_rejected_total'"
+            ).fetchone()
+            return int(row["value"]) if row else 0
+
+    def recent_rejection_count(self, window_seconds: float,
+                               now: float | None = None) -> int:
+        """Backpressure rejections observed within the last window."""
+        now = now if now is not None else time.time()
+        cutoff = now - window_seconds
+        with self._lock:
+            while self._recent_rejections and self._recent_rejections[0] < cutoff:
+                self._recent_rejections.popleft()
+            return len(self._recent_rejections)
+
+    def recent_failure_count(self, window_seconds: float,
+                             now: float | None = None) -> int:
+        """Execution failure events (retryable/non-retryable/dead) within the
+        last window — distinct from backpressure rejections."""
+        now = now if now is not None else time.time()
+        cutoff = now - window_seconds
+        placeholders = ",".join("?" for _ in FAILURE_EVENTS)
+        with self._lock:
+            row = self._conn.execute(
+                f"""SELECT COUNT(*) AS c FROM job_events
+                    WHERE event IN ({placeholders}) AND created_at >= ?""",
+                (*FAILURE_EVENTS, cutoff),
+            ).fetchone()
+            return int(row["c"])

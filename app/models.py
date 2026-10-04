@@ -47,3 +47,4 @@ class QueueConfig:
     base_backoff_seconds: float = 0.05
     max_backoff_seconds: float = 1.0
     poll_interval_seconds: float = 0.02
+    recent_window_seconds: float = 60.0  # "recently rejecting/failing" window
